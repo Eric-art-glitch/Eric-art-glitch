@@ -1,8 +1,11 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
 import { db, initDb } from './db.js';
 import { pushStk } from './daraja.js';
+import { sendSMS, sendOtpSms, generateOtp } from './africastalking.js';
 
 dotenv.config();
 initDb();
@@ -10,6 +13,24 @@ initDb();
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const JWT_SECRET = process.env.JWT_SECRET || 'change_me_in_production';
+
+function hashOtp(otp) {
+  return crypto.createHash('sha256').update(otp).digest('hex');
+}
+
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+  try {
+    req.user = jwt.verify(token, JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+  }
+}
 
 function normalizePhone(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
@@ -36,12 +57,89 @@ function refreshGroupAndBooking(groupId) {
   }
 }
 
+// ── Auth: request OTP ────────────────────────────────────────────────────────
+app.post('/api/auth/request-otp', async (req, res) => {
+  let phone;
+  try {
+    phone = normalizePhone(req.body.phone);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  // Rate-limit: max 1 OTP per minute per phone
+  const recent = db.prepare(
+    "SELECT id FROM otps WHERE phone = ? AND created_at > datetime('now', '-1 minute') AND used = 0"
+  ).get(phone);
+  if (recent) return res.status(429).json({ error: 'Please wait before requesting another OTP' });
+
+  const otp = generateOtp(6);
+  const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+  db.prepare('INSERT INTO otps (phone, otp_hash, expires_at) VALUES (?, ?, ?)').run(phone, hashOtp(otp), expiresAt);
+
+  try {
+    await sendOtpSms(phone, otp);
+  } catch (err) {
+    console.error('AT SMS error:', err.message);
+    return res.status(502).json({ error: 'Failed to send OTP SMS. Please try again.' });
+  }
+
+  res.json({ ok: true, message: 'OTP sent to your phone.' });
+});
+
+// ── Auth: verify OTP ──────────────────────────────────────────────────────────
+app.post('/api/auth/verify-otp', (req, res) => {
+  let phone;
+  try {
+    phone = normalizePhone(req.body.phone);
+  } catch (e) {
+    return res.status(400).json({ error: e.message });
+  }
+
+  const { otp } = req.body;
+  if (!otp) return res.status(400).json({ error: 'OTP is required' });
+
+  const now = new Date().toISOString();
+  const record = db.prepare(
+    'SELECT * FROM otps WHERE phone = ? AND otp_hash = ? AND used = 0 AND expires_at > ? ORDER BY id DESC LIMIT 1'
+  ).get(phone, hashOtp(String(otp)), now);
+
+  if (!record) return res.status(401).json({ error: 'Invalid or expired OTP' });
+
+  db.prepare('UPDATE otps SET used = 1 WHERE id = ?').run(record.id);
+
+  // Upsert user
+  db.prepare('INSERT INTO users (phone) VALUES (?) ON CONFLICT(phone) DO NOTHING').run(phone);
+  const user = db.prepare('SELECT * FROM users WHERE phone = ?').get(phone);
+
+  const token = jwt.sign({ userId: user.id, phone: user.phone }, JWT_SECRET, { expiresIn: '7d' });
+  res.json({ ok: true, token, user: { id: user.id, phone: user.phone, name: user.name } });
+});
+
+// ── Auth: me ──────────────────────────────────────────────────────────────────
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  const user = db.prepare('SELECT id, phone, name, created_at FROM users WHERE id = ?').get(req.user.userId);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  res.json(user);
+});
+
 app.post('/api/bookings', (req, res) => {
-  const { pitch_id, start_time, end_time, total_amount, hold_minutes = 15 } = req.body;
+  const { pitch_id, start_time, end_time, total_amount, hold_minutes = 15, organizer_phone } = req.body;
   const hold_expires_at = new Date(Date.now() + hold_minutes * 60000).toISOString();
   const result = db.prepare('INSERT INTO bookings (pitch_id, start_time, end_time, total_amount, hold_expires_at) VALUES (?, ?, ?, ?, ?)')
     .run(pitch_id, start_time, end_time, total_amount, hold_expires_at);
   const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
+
+  if (organizer_phone) {
+    try {
+      const phone = normalizePhone(organizer_phone);
+      const start = new Date(start_time).toLocaleString('en-KE', { timeZone: 'Africa/Nairobi' });
+      sendSMS(phone, `Booking #${booking.id} confirmed for pitch ${pitch_id} on ${start}. Total: KES ${total_amount}. Hold expires in ${hold_minutes} min.`)
+        .catch((e) => console.error('AT booking SMS error:', e.message));
+    } catch {
+      // non-critical, don't fail the request
+    }
+  }
+
   res.status(201).json(booking);
 });
 
@@ -81,6 +179,13 @@ app.post('/api/bookings/:id/split', (req, res) => {
 
   const invite_links = participants.map((p) => ({ participant_id: p.id, url: `/payments/checkout?participant=${p.id}` }));
   const group = db.prepare('SELECT * FROM split_groups WHERE id = ?').get(groupId);
+
+  // Notify each participant via SMS
+  for (const p of participants) {
+    const link = `${process.env.APP_URL || ''}/payments/checkout?participant=${p.id}`;
+    sendSMS(p.phone, `Hi ${p.name}, you've been added to a split payment for booking #${bookingId}. Your share: KES ${p.amount_due}. Pay here: ${link}`)
+      .catch((e) => console.error(`AT split SMS error (participant ${p.id}):`, e.message));
+  }
 
   res.status(201).json({ group, participants, invite_links });
 });
@@ -140,6 +245,9 @@ app.post('/api/mpesa/callback/stk', (req, res) => {
     db.prepare('INSERT INTO payments (participant_id, amount, mpesa_receipt, result_code, result_desc, paid_at, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(participant.id, amount, receipt, callback.ResultCode, callback.ResultDesc, new Date().toISOString(), JSON.stringify(req.body));
     refreshGroupAndBooking(participant.group_id);
+
+    sendSMS(participant.phone, `Payment of KES ${amount} received. Receipt: ${receipt}. Thank you, ${participant.name}!`)
+      .catch((e) => console.error('AT payment SMS error:', e.message));
   } else {
     db.prepare("UPDATE split_participants SET status = 'FAILED' WHERE id = ?").run(participant.id);
     db.prepare('INSERT INTO payments (participant_id, amount, mpesa_receipt, result_code, result_desc, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?)')
