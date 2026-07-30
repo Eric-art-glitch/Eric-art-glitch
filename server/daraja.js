@@ -27,10 +27,12 @@ async function getAccessToken() {
   return data.access_token;
 }
 
-export async function pushStk({ phone, amount, bookingId }) {
+export async function pushStk({ phone, amount, bookingId, paymentType = 'FULL' }) {
   const timestamp = getTimestamp();
   const password = Buffer.from(`${DARAJA_SHORTCODE}${DARAJA_PASSKEY}${timestamp}`).toString('base64');
   const token = await getAccessToken();
+
+  const transactionDesc = paymentType === 'DEPOSIT' ? 'Turf booking deposit' : 'Turf booking payment';
 
   const body = {
     BusinessShortCode: DARAJA_SHORTCODE,
@@ -43,7 +45,7 @@ export async function pushStk({ phone, amount, bookingId }) {
     PhoneNumber: phone,
     CallBackURL: DARAJA_CALLBACK_URL,
     AccountReference: `BOOK-${bookingId}`,
-    TransactionDesc: 'Turf booking split'
+    TransactionDesc: transactionDesc
   };
 
   const res = await fetch(`${DARAJA_BASE_URL}/mpesa/stkpush/v1/processrequest`, {

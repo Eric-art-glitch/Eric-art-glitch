@@ -11,6 +11,9 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const MIN_DEPOSIT_PERCENT = 10;
+const MAX_DEPOSIT_PERCENT = 90;
+
 function normalizePhone(phone) {
   const digits = String(phone || '').replace(/\D/g, '');
   if (/^2547\d{8}$/.test(digits)) return digits;
@@ -18,94 +21,88 @@ function normalizePhone(phone) {
   throw new Error('Phone must be 2547XXXXXXXX');
 }
 
-function splitEqual(total, count) {
-  const base = Math.floor(total / count);
-  const remainder = total % count;
-  return Array.from({ length: count }, (_, i) => base + (i < remainder ? 1 : 0));
-}
+function resolveAmountDue(totalAmount, paymentType, depositPercent) {
+  if (paymentType === 'FULL') return totalAmount;
 
-function refreshGroupAndBooking(groupId) {
-  const group = db.prepare('SELECT * FROM split_groups WHERE id = ?').get(groupId);
-  if (!group) return;
-
-  const paid = db.prepare("SELECT COALESCE(SUM(amount_paid), 0) AS total FROM split_participants WHERE group_id = ? AND status = 'PAID'").get(groupId).total;
-
-  if (paid >= group.total_amount) {
-    db.prepare("UPDATE split_groups SET status = 'COMPLETE' WHERE id = ?").run(groupId);
-    db.prepare("UPDATE bookings SET status = 'CONFIRMED' WHERE id = ?").run(group.booking_id);
+  if (
+    !Number.isInteger(depositPercent) ||
+    depositPercent < MIN_DEPOSIT_PERCENT ||
+    depositPercent > MAX_DEPOSIT_PERCENT
+  ) {
+    throw new Error(`deposit_percent must be an integer between ${MIN_DEPOSIT_PERCENT} and ${MAX_DEPOSIT_PERCENT}`);
   }
+
+  return Math.ceil((totalAmount * depositPercent) / 100);
 }
 
 app.post('/api/bookings', (req, res) => {
-  const { pitch_id, start_time, end_time, total_amount, hold_minutes = 15 } = req.body;
+  const {
+    pitch_id,
+    start_time,
+    end_time,
+    total_amount,
+    hold_minutes = 15,
+    payment_type = 'FULL',
+    deposit_percent,
+    phone
+  } = req.body;
+
+  if (payment_type !== 'FULL' && payment_type !== 'DEPOSIT') {
+    return res.status(400).json({ error: "payment_type must be 'FULL' or 'DEPOSIT'" });
+  }
+
+  let safePhone;
+  let amount_due;
+  try {
+    safePhone = normalizePhone(phone);
+    amount_due = resolveAmountDue(total_amount, payment_type, deposit_percent);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+
   const hold_expires_at = new Date(Date.now() + hold_minutes * 60000).toISOString();
-  const result = db.prepare('INSERT INTO bookings (pitch_id, start_time, end_time, total_amount, hold_expires_at) VALUES (?, ?, ?, ?, ?)')
-    .run(pitch_id, start_time, end_time, total_amount, hold_expires_at);
+  const result = db.prepare(
+    `INSERT INTO bookings
+      (pitch_id, start_time, end_time, total_amount, payment_type, deposit_percent, amount_due, phone, hold_expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    pitch_id,
+    start_time,
+    end_time,
+    total_amount,
+    payment_type,
+    payment_type === 'DEPOSIT' ? deposit_percent : null,
+    amount_due,
+    safePhone,
+    hold_expires_at
+  );
+
   const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(result.lastInsertRowid);
   res.status(201).json(booking);
 });
 
-app.post('/api/bookings/:id/split', (req, res) => {
+app.post('/api/bookings/:id/stk', async (req, res) => {
   const bookingId = Number(req.params.id);
   const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(bookingId);
   if (!booking) return res.status(404).json({ error: 'Booking not found' });
 
-  const { players, number_of_players } = req.body;
-  let participantInputs = [];
-  let split_method = 'EQUAL';
-
-  if (Array.isArray(players) && players.length) {
-    participantInputs = players;
-    split_method = players.some((p) => p.amount_due != null) ? 'CUSTOM' : 'EQUAL';
-  } else if (Number.isInteger(number_of_players) && number_of_players > 0) {
-    participantInputs = Array.from({ length: number_of_players }, (_, i) => ({ name: `Player ${i + 1}`, phone: `2547000000${String(i).padStart(2, '0')}` }));
-  } else {
-    return res.status(400).json({ error: 'Provide players[] or number_of_players' });
+  if (booking.status !== 'HELD' && booking.status !== 'STK_SENT') {
+    return res.status(400).json({ error: `Booking is not awaiting payment (status: ${booking.status})` });
   }
-
-  const deadline_at = booking.hold_expires_at;
-  const groupResult = db.prepare('INSERT INTO split_groups (booking_id, total_amount, split_method, deadline_at) VALUES (?, ?, ?, ?)')
-    .run(bookingId, booking.total_amount, split_method, deadline_at);
-  const groupId = Number(groupResult.lastInsertRowid);
-
-  const equalShares = splitEqual(booking.total_amount, participantInputs.length);
-
-  const insertParticipant = db.prepare('INSERT INTO split_participants (group_id, name, phone, amount_due, status) VALUES (?, ?, ?, ?, ?)');
-
-  const participants = participantInputs.map((p, idx) => {
-    const amount_due = Number.isInteger(p.amount_due) ? p.amount_due : equalShares[idx];
-    const safePhone = normalizePhone(p.phone);
-    const result = insertParticipant.run(groupId, p.name || `Player ${idx + 1}`, safePhone, amount_due, 'INVITED');
-    return db.prepare('SELECT * FROM split_participants WHERE id = ?').get(result.lastInsertRowid);
-  });
-
-  const invite_links = participants.map((p) => ({ participant_id: p.id, url: `/payments/checkout?participant=${p.id}` }));
-  const group = db.prepare('SELECT * FROM split_groups WHERE id = ?').get(groupId);
-
-  res.status(201).json({ group, participants, invite_links });
-});
-
-app.post('/api/split/participants/:participantId/stk', async (req, res) => {
-  const participantId = Number(req.params.participantId);
-  const participant = db.prepare('SELECT * FROM split_participants WHERE id = ?').get(participantId);
-  if (!participant) return res.status(404).json({ error: 'Participant not found' });
-
-  const group = db.prepare('SELECT * FROM split_groups WHERE id = ?').get(participant.group_id);
-  const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(group.booking_id);
 
   try {
     const response = await pushStk({
-      phone: participant.phone,
-      amount: participant.amount_due,
-      bookingId: booking.id
+      phone: booking.phone,
+      amount: booking.amount_due,
+      bookingId: booking.id,
+      paymentType: booking.payment_type
     });
 
-    db.prepare("UPDATE split_participants SET status = 'STK_SENT', checkout_request_id = ?, merchant_request_id = ? WHERE id = ?")
-      .run(response.CheckoutRequestID, response.MerchantRequestID, participantId);
+    db.prepare("UPDATE bookings SET status = 'STK_SENT', checkout_request_id = ?, merchant_request_id = ? WHERE id = ?")
+      .run(response.CheckoutRequestID, response.MerchantRequestID, bookingId);
 
     res.json({ ok: true, response });
   } catch (error) {
-    db.prepare("UPDATE split_participants SET status = 'FAILED' WHERE id = ?").run(participantId);
     res.status(502).json({ ok: false, error: error.message });
   }
 });
@@ -114,8 +111,8 @@ app.post('/api/mpesa/callback/stk', (req, res) => {
   const callback = req.body?.Body?.stkCallback;
   if (!callback?.CheckoutRequestID) return res.status(400).json({ error: 'Missing CheckoutRequestID' });
 
-  const participant = db.prepare('SELECT * FROM split_participants WHERE checkout_request_id = ?').get(callback.CheckoutRequestID);
-  if (!participant) return res.status(404).json({ error: 'Unknown CheckoutRequestID' });
+  const booking = db.prepare('SELECT * FROM bookings WHERE checkout_request_id = ?').get(callback.CheckoutRequestID);
+  if (!booking) return res.status(404).json({ error: 'Unknown CheckoutRequestID' });
 
   const itemMap = Object.fromEntries((callback.CallbackMetadata?.Item || []).map((x) => [x.Name, x.Value]));
   const amount = Number(itemMap.Amount || 0);
@@ -126,53 +123,42 @@ app.post('/api/mpesa/callback/stk', (req, res) => {
   if (exists) return res.json({ ok: true, duplicate: true });
 
   if (callback.ResultCode === 0) {
-    if (phone && phone !== participant.phone) {
+    if (phone && phone !== booking.phone) {
       return res.status(400).json({ error: 'Phone mismatch' });
     }
-    if (amount !== participant.amount_due) {
-      db.prepare("UPDATE split_participants SET status = 'FAILED' WHERE id = ?").run(participant.id);
-      db.prepare('INSERT INTO payments (participant_id, amount, mpesa_receipt, result_code, result_desc, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(participant.id, amount, receipt, callback.ResultCode, 'Amount mismatch', JSON.stringify(req.body));
+    if (amount !== booking.amount_due) {
+      db.prepare('INSERT INTO payments (booking_id, amount, mpesa_receipt, result_code, result_desc, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(booking.id, amount, receipt, callback.ResultCode, 'Amount mismatch', JSON.stringify(req.body));
       return res.status(400).json({ error: 'Amount mismatch' });
     }
 
-    db.prepare("UPDATE split_participants SET status = 'PAID', amount_paid = ? WHERE id = ?").run(amount, participant.id);
-    db.prepare('INSERT INTO payments (participant_id, amount, mpesa_receipt, result_code, result_desc, paid_at, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
-      .run(participant.id, amount, receipt, callback.ResultCode, callback.ResultDesc, new Date().toISOString(), JSON.stringify(req.body));
-    refreshGroupAndBooking(participant.group_id);
+    db.prepare("UPDATE bookings SET status = 'CONFIRMED', amount_paid = ? WHERE id = ?").run(amount, booking.id);
+    db.prepare('INSERT INTO payments (booking_id, amount, mpesa_receipt, result_code, result_desc, paid_at, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(booking.id, amount, receipt, callback.ResultCode, callback.ResultDesc, new Date().toISOString(), JSON.stringify(req.body));
   } else {
-    db.prepare("UPDATE split_participants SET status = 'FAILED' WHERE id = ?").run(participant.id);
-    db.prepare('INSERT INTO payments (participant_id, amount, mpesa_receipt, result_code, result_desc, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(participant.id, amount, receipt, callback.ResultCode, callback.ResultDesc, JSON.stringify(req.body));
+    db.prepare("UPDATE bookings SET status = 'HELD' WHERE id = ?").run(booking.id);
+    db.prepare('INSERT INTO payments (booking_id, amount, mpesa_receipt, result_code, result_desc, raw_callback_json) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(booking.id, amount, receipt, callback.ResultCode, callback.ResultDesc, JSON.stringify(req.body));
   }
 
   res.json({ ok: true });
 });
 
-app.get('/api/split/groups/:groupId', (req, res) => {
-  const groupId = Number(req.params.groupId);
-  const group = db.prepare('SELECT * FROM split_groups WHERE id = ?').get(groupId);
-  if (!group) return res.status(404).json({ error: 'Group not found' });
-
-  const participants = db.prepare('SELECT * FROM split_participants WHERE group_id = ? ORDER BY id').all(groupId);
-  const paid_amount = participants.reduce((sum, p) => sum + (p.status === 'PAID' ? p.amount_paid : 0), 0);
+app.get('/api/bookings/:id', (req, res) => {
+  const bookingId = Number(req.params.id);
+  const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(bookingId);
+  if (!booking) return res.status(404).json({ error: 'Booking not found' });
 
   res.json({
-    group,
-    paid_amount,
-    pending_amount: group.total_amount - paid_amount,
-    participants
+    booking,
+    remaining_balance: booking.total_amount - booking.amount_paid
   });
 });
 
 setInterval(() => {
   const now = new Date().toISOString();
-  const expiredBookings = db.prepare("SELECT id FROM bookings WHERE status = 'HELD' AND hold_expires_at < ?").all(now);
-  for (const booking of expiredBookings) {
-    db.prepare("UPDATE bookings SET status = 'CANCELLED' WHERE id = ?").run(booking.id);
-    db.prepare("UPDATE split_groups SET status = 'EXPIRED' WHERE booking_id = ? AND status = 'OPEN'").run(booking.id);
-    db.prepare("UPDATE split_participants SET status = 'EXPIRED' WHERE group_id IN (SELECT id FROM split_groups WHERE booking_id = ?)").run(booking.id);
-  }
+  db.prepare("UPDATE bookings SET status = 'CANCELLED' WHERE status IN ('HELD', 'STK_SENT') AND hold_expires_at < ?")
+    .run(now);
 }, 30_000);
 
 const port = process.env.PORT || 3000;
