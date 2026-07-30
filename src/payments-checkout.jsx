@@ -1,81 +1,144 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3000';
+const DEPOSIT_PRESETS = [25, 50, 75];
 
 export function PaymentsCheckout() {
-  const [mode, setMode] = useState('SPLIT');
+  const [mode, setMode] = useState('FULL');
   const [total, setTotal] = useState(2000);
-  const [players, setPlayers] = useState([
-    { name: 'Alex', phone: '254712345678' },
-    { name: 'Brian', phone: '254722345678' }
-  ]);
-  const [group, setGroup] = useState(null);
+  const [depositPercent, setDepositPercent] = useState(50);
+  const [phone, setPhone] = useState('');
+  const [booking, setBooking] = useState(null);
   const [status, setStatus] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
-  const shares = useMemo(() => {
-    if (!players.length) return [];
-    const base = Math.floor(total / players.length);
-    const remainder = total % players.length;
-    return players.map((_, i) => base + (i < remainder ? 1 : 0));
-  }, [players, total]);
+  const amountDue = useMemo(() => {
+    if (mode === 'FULL') return total;
+    return Math.ceil((total * depositPercent) / 100);
+  }, [mode, total, depositPercent]);
 
-  const addPlayer = () => setPlayers((prev) => [...prev, { name: '', phone: '' }]);
+  const remainingBalance = total - amountDue;
 
-  const requestPayments = async () => {
-    setStatus('Creating booking and split...');
-    const booking = await fetch(`${API_BASE}/api/bookings`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pitch_id: 1, start_time: new Date().toISOString(), end_time: new Date(Date.now() + 3600000).toISOString(), total_amount: total })
-    }).then((r) => r.json());
+  useEffect(() => {
+    if (!booking || booking.status === 'CONFIRMED' || booking.status === 'CANCELLED') return;
 
-    const created = await fetch(`${API_BASE}/api/bookings/${booking.id}/split`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ players: players.map((p, i) => ({ ...p, amount_due: shares[i] })) })
-    }).then((r) => r.json());
+    const interval = setInterval(async () => {
+      const res = await fetch(`${API_BASE}/api/bookings/${booking.id}`);
+      if (!res.ok) return;
+      const data = await res.json();
+      setBooking(data.booking);
+      if (data.booking.status === 'CONFIRMED') {
+        setStatus(mode === 'FULL' ? 'Payment received. Your slot is confirmed! 🎉' : 'Deposit received. Your slot is held — pay the rest at the turf.');
+      } else if (data.booking.status === 'CANCELLED') {
+        setStatus('Booking expired before payment was completed.');
+      }
+    }, 3000);
 
-    for (const participant of created.participants) {
-      await fetch(`${API_BASE}/api/split/participants/${participant.id}/stk`, { method: 'POST' });
+    return () => clearInterval(interval);
+  }, [booking, mode]);
+
+  const requestPayment = async () => {
+    setSubmitting(true);
+    setStatus('Creating your booking...');
+    try {
+      const created = await fetch(`${API_BASE}/api/bookings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pitch_id: 1,
+          start_time: new Date().toISOString(),
+          end_time: new Date(Date.now() + 3600000).toISOString(),
+          total_amount: total,
+          payment_type: mode,
+          deposit_percent: mode === 'DEPOSIT' ? depositPercent : undefined,
+          phone
+        })
+      }).then((r) => r.json());
+
+      if (created.error) {
+        setStatus(`Error: ${created.error}`);
+        return;
+      }
+
+      setBooking(created);
+      setStatus('Sending M-Pesa prompt to your phone...');
+
+      const stk = await fetch(`${API_BASE}/api/bookings/${created.id}/stk`, { method: 'POST' }).then((r) => r.json());
+
+      if (!stk.ok) {
+        setStatus(`Error: ${stk.error}`);
+        return;
+      }
+
+      setStatus('Enter your M-Pesa PIN on your phone to complete payment.');
+    } finally {
+      setSubmitting(false);
     }
-
-    setGroup(created.group);
-    setStatus('STK requests sent.');
   };
 
   return (
     <main style={{ fontFamily: 'sans-serif', maxWidth: 720, margin: '1rem auto' }}>
-      <h1>/payments/checkout</h1>
+      <h1>Turf Mafia — Book & Pay</h1>
+      <p>Reserve your slot now: pay in full, or lock it in with a deposit and settle the rest at the turf.</p>
+
       <label>
-        <input type="radio" checked={mode === 'FULL'} onChange={() => setMode('FULL')} /> Pay full
+        <input type="radio" checked={mode === 'FULL'} onChange={() => setMode('FULL')} /> Pay in full
       </label>{' '}
       <label>
-        <input type="radio" checked={mode === 'SPLIT'} onChange={() => setMode('SPLIT')} /> Split
+        <input type="radio" checked={mode === 'DEPOSIT'} onChange={() => setMode('DEPOSIT')} /> Pay a deposit
       </label>
 
-      {mode === 'SPLIT' && (
-        <section>
-          <h3>Players</h3>
-          {players.map((p, i) => (
-            <div key={i} style={{ display: 'flex', gap: 8, marginBottom: 6 }}>
-              <input placeholder="Name" value={p.name} onChange={(e) => setPlayers((prev) => prev.map((x, idx) => idx === i ? { ...x, name: e.target.value } : x))} />
-              <input placeholder="2547xxxxxxxx" value={p.phone} onChange={(e) => setPlayers((prev) => prev.map((x, idx) => idx === i ? { ...x, phone: e.target.value } : x))} />
-              <span>KES {shares[i] || 0}</span>
-            </div>
-          ))}
-          <button onClick={addPlayer}>Add player</button>
-          <button onClick={requestPayments}>Send payment requests</button>
-        </section>
-      )}
+      <section style={{ marginTop: 16 }}>
+        <label style={{ display: 'block', marginBottom: 6 }}>
+          Total amount (KES){' '}
+          <input type="number" min="1" value={total} onChange={(e) => setTotal(Number(e.target.value) || 0)} />
+        </label>
+
+        {mode === 'DEPOSIT' && (
+          <div style={{ marginBottom: 6 }}>
+            {DEPOSIT_PRESETS.map((p) => (
+              <button
+                key={p}
+                type="button"
+                onClick={() => setDepositPercent(p)}
+                style={{ fontWeight: depositPercent === p ? 'bold' : 'normal', marginRight: 6 }}
+              >
+                {p}%
+              </button>
+            ))}
+            <input
+              type="number"
+              min="10"
+              max="90"
+              value={depositPercent}
+              onChange={(e) => setDepositPercent(Number(e.target.value) || 0)}
+              style={{ width: 60, marginLeft: 6 }}
+            />
+            %
+          </div>
+        )}
+
+        <label style={{ display: 'block', marginBottom: 6 }}>
+          Phone{' '}
+          <input placeholder="2547xxxxxxxx" value={phone} onChange={(e) => setPhone(e.target.value)} />
+        </label>
+
+        <p>
+          <strong>Pay now: KES {amountDue}</strong>
+          {mode === 'DEPOSIT' && <span> &mdash; remaining balance KES {remainingBalance} due at the turf</span>}
+        </p>
+
+        <button onClick={requestPayment} disabled={submitting}>
+          {mode === 'FULL' ? 'Pay full amount' : 'Pay deposit'}
+        </button>
+      </section>
 
       <p>{status}</p>
-      {group && <p>Group #{group.id} created. Poll <code>/api/split/groups/{group.id}</code> for progress.</p>}
-      <ul>
-        <li>✅ Paid</li>
-        <li>⏳ Pending (STK sent)</li>
-        <li>❌ Failed (Retry)</li>
-      </ul>
-      <progress max={total} value={0} />
-      <p>Hold expires in 12:34</p>
-      <button>Cover remaining</button>
+      {booking && (
+        <p>
+          Booking #{booking.id} — status: {booking.status}
+        </p>
+      )}
     </main>
   );
 }
